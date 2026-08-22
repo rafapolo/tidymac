@@ -12,7 +12,7 @@ import argparse, asyncio, contextlib, json, os, re, signal, sys, time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Sequence
+from typing import Callable, Iterable, Iterator, Sequence, TextIO
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, ScrollableContainer, Vertical
@@ -46,6 +46,10 @@ _WALK_SKIP = frozenset({
 
 # Regenerable build/test droppings swept out of the whole home tree. Every one
 # of these is rebuilt on the next run of the tool that made it.
+# Signed bundles. Deleting anything inside one breaks its seal, and real
+# .app/.bundle payloads (updaters, helpers) live under Application Support.
+_BUNDLE_SUFFIXES = ('.app', '.bundle', '.framework', '.plugin', '.kext')
+
 _CRUFT_DIRS = frozenset({
     '.ipynb_checkpoints', '.mypy_cache', '.pytest_cache', '.ruff_cache',
     '__pycache__',
@@ -101,6 +105,11 @@ class Result:
     skipped: bool = False
     failed: bool = False
     note: str = ''
+    # Which command failed, and the tail of what it printed. Without these a
+    # failed task says only that something failed, and the output that would
+    # explain it is gone: the TUI log is capped and dies with the app.
+    failed_cmd: str = ''
+    failed_tail: list[str] = field(default_factory=list)
 
     def label(self) -> str:
         if self.skipped:
@@ -196,24 +205,62 @@ async def _run_cmd(cmd: Sequence[str], log: Callable[[str], None]) -> int:
                 await proc.wait()
 
 
+FAIL_TAIL_LINES = 20  # of a failing command's output, kept for the report
+
+
+@dataclass(slots=True)
+class _Series:
+    '''How a run of commands went: how many failed, and detail on the first.'''
+    failures: int = 0
+    cmd: str = ''
+    tail: list[str] = field(default_factory=list)
+
+
+def _fail_note(series: _Series) -> str:
+    '''Name the command that failed. A bare count sends you log-digging.'''
+    if not series.failures:
+        return ''
+    more = f' (+{series.failures - 1} more)' if series.failures > 1 else ''
+    # The note lands in a one-line TUI label; the untruncated command line and
+    # its output are in the run report.
+    cmd = series.cmd if len(series.cmd) <= 60 else series.cmd[:59] + '\u2026'
+    return f'failed: {cmd}{more}'
+
+
 async def _run_series(
     cmds: Iterable[Sequence[str]],
     log: Callable[[str], None],
     counted: Callable[[str], None] | None = None,
     count_only: frozenset[int] | None = None,
-) -> int:
-    '''Run commands in order; returns how many exited non-zero.
+) -> _Series:
+    '''Run commands in order, reporting how many exited non-zero.
+
+    The first failure keeps its command line and the tail of its output, so a
+    run report can say what broke instead of just how many things did.
 
     count_only restricts package counting to the given command indices, so
     diagnostics like `brew doctor` can't inflate the upgrade tally.
     '''
-    failures = 0
+    outcome = _Series()
     for i, cmd in enumerate(cmds):
         log(f'$ {" ".join(cmd)}')
         sink = counted if counted and (count_only is None or i in count_only) else log
-        if await _run_cmd(cmd, sink) != 0:
-            failures += 1
-    return failures
+        tail: list[str] = []
+
+        # Tee every line to its usual sink and keep a rolling tail, which is
+        # only read if this command turns out to have failed.
+        def keep(msg: str) -> None:
+            sink(msg)
+            tail.append(msg)
+            if len(tail) > FAIL_TAIL_LINES:
+                del tail[0]
+
+        if await _run_cmd(cmd, keep) != 0:
+            outcome.failures += 1
+            if not outcome.cmd:
+                outcome.cmd = ' '.join(cmd)
+                outcome.tail = list(tail)
+    return outcome
 
 
 # ── Filesystem helpers ───────────────────────────────────────────────────────
@@ -371,6 +418,8 @@ async def _clean_lang_packs(log: Callable[[str], None]) -> Result:
         if not base.is_dir():
             return freed, count
         for root, dirnames, _ in os.walk(base):
+            # Bundles first: their Resources hold .lproj we must not touch.
+            dirnames[:] = [d for d in dirnames if not d.endswith(_BUNDLE_SUFFIXES)]
             targets = [d for d in dirnames if d.endswith('.lproj') and d not in keep]
             # Prune: purged trees are gone, kept ones hold no nested .lproj.
             dirnames[:] = [d for d in dirnames if not d.endswith('.lproj')]
@@ -415,7 +464,7 @@ async def _home_sweep(log: Callable[[str], None]) -> Result:
             dirnames[:] = [
                 d for d in dirnames
                 if d not in _WALK_SKIP and d not in _CRUFT_DIRS
-                and not d.endswith('.app')
+                and not d.endswith(_BUNDLE_SUFFIXES)
             ]
             for name in targets:
                 f, c = _purge_tree(os.path.join(root, name))
@@ -516,11 +565,13 @@ def _upgrade_runner(
             if matcher:
                 matcher(msg, counter)
 
-        failures = await _run_series(cmds, log, counted, count_only)
+        series = await _run_series(cmds, log, counted, count_only)
         return Result(
             pkgs=counter.n,
-            failed=bool(failures),
-            note=f'{failures} cmd failed' if failures else '',
+            failed=bool(series.failures),
+            note=_fail_note(series),
+            failed_cmd=series.cmd,
+            failed_tail=series.tail,
         )
 
     return run
@@ -545,10 +596,11 @@ async def _brew_upgrade(log: Callable[[str], None]) -> Result:
         _m_brew(msg, counter)
 
     # brew doctor/missing exit non-zero routinely; don't call that a failure.
-    failures = await _run_series(cmds[:5], log, counted, frozenset({1, 2}))
+    series = await _run_series(cmds[:5], log, counted, frozenset({1, 2}))
     await _run_series(cmds[5:], log)
-    return Result(pkgs=counter.n, failed=bool(failures),
-                  note=f'{failures} cmd failed' if failures else '')
+    return Result(pkgs=counter.n, failed=bool(series.failures),
+                  note=_fail_note(series), failed_cmd=series.cmd,
+                  failed_tail=series.tail)
 
 
 async def _docker_prune(log: Callable[[str], None]) -> Result:
@@ -622,8 +674,9 @@ async def _nuget_clean(log: Callable[[str], None]) -> Result:
 
 
 async def _simple_cmds(cmds: Sequence[Sequence[str]], log: Callable[[str], None]) -> Result:
-    failures = await _run_series(cmds, log)
-    return Result(failed=bool(failures), note=f'{failures} cmd failed' if failures else '')
+    series = await _run_series(cmds, log)
+    return Result(failed=bool(series.failures), note=_fail_note(series),
+                  failed_cmd=series.cmd, failed_tail=series.tail)
 
 
 # ── Task table ───────────────────────────────────────────────────────────────
@@ -1278,6 +1331,7 @@ class TidymacApp(App[None]):
         self._disk_before = _disk_free()
         self._records: list[dict] = []
         self._locks = _LockSet()
+        self._stream = _open_run_log()
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1301,6 +1355,12 @@ class TidymacApp(App[None]):
         # max_lines caps memory: ~40 tasks streaming build output adds up fast.
         yield RichLog(id='log', highlight=True, markup=False, wrap=True, max_lines=2000)
         yield Footer()
+
+    def on_unmount(self) -> None:
+        # Quitting mid-run still leaves what ran on disk, which is the point.
+        if self._stream:
+            self._stream.close()
+            self._stream = None
 
     def on_mount(self) -> None:
         self.register_theme(GRUVBOX)
@@ -1339,6 +1399,8 @@ class TidymacApp(App[None]):
 
             def task_log(msg: str) -> None:
                 log_widget.write(f'{t.name}: {msg}')
+                if self._stream:
+                    self._stream.write(f'{t.name}: {msg}\n')
 
             def on_start() -> None:  # only once the task actually holds its locks
                 icon.update(ICON_RUN)
@@ -1377,12 +1439,29 @@ class TidymacApp(App[None]):
         done = 'Dry run done' if DRY_RUN else 'Done ✓'
         self.title = f'{done}  ·  {summary}' if summary else done
         log_widget.write(f'\n{done}' + (f'  ·  {summary}' if summary else ''))
+        if self._stream:
+            self._stream.close()
+            self._stream = None
         if report := _write_report(self._records, totals):
             log_widget.write(f'report: {report}')
         await _notify(summary)
 
 
 # ── Reporting ────────────────────────────────────────────────────────────────
+def _open_run_log() -> TextIO | None:
+    '''Tee task output to a file both front ends share.
+
+    The TUI's RichLog is capped and dies with the app, so a failure you only
+    watched scroll past used to leave nothing behind to read afterwards.
+    '''
+    with contextlib.suppress(OSError):
+        REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        return (REPORT_DIR / 'last-run.log').open('w')
+    except OSError:
+        return None
+
+
 def _write_report(records: list[dict], totals: dict) -> Path | None:
     '''Persist one run as JSON. The TUI log is capped and dies with the app;
     this is what lets you compare a run against the last one.'''
@@ -1428,11 +1507,16 @@ def _totals(records: list[dict], started: str, freed_disk: int) -> dict:
 
 
 def _record(task: Task, res: Result, elapsed: float, status: str) -> dict:
-    return {
+    rec = {
         'id': task.id, 'name': task.name, 'subcategory': task.subcategory,
         'status': status, 'freed': res.freed, 'files': res.files,
         'pkgs': res.pkgs, 'note': res.note, 'seconds': round(elapsed, 1),
     }
+    # Only a failure carries detail; every other record stays as terse as before.
+    if res.failed_cmd:
+        rec['failed_cmd'] = res.failed_cmd
+        rec['failed_tail'] = res.failed_tail
+    return rec
 
 
 def _summary_line(totals: dict) -> str:
@@ -1474,13 +1558,7 @@ async def run_headless() -> int:
     before = _disk_free()
     locks = _LockSet()
     records: list[dict] = []
-    log_path = REPORT_DIR / 'last-run.log'
-    with contextlib.suppress(OSError):
-        REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        stream = log_path.open('w')
-    except OSError:
-        stream = None
+    stream = _open_run_log()
 
     print(f'upgrade-and-clean · {len(ALL_TASKS)} tasks'
           + ('  ·  DRY RUN' if DRY_RUN else ''), flush=True)
