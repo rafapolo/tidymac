@@ -432,6 +432,33 @@ async def _dot_cache(log: Callable[[str], None]) -> Result:
     return await _clean_paths([str(base / n) for n in names], log)
 
 
+# Snaps and flatpaks each get a private $HOME, so their caches never land in
+# ~/.cache. Apps with a dedicated row are left to it.
+_SNAP_OWN_ROW = frozenset({'firefox', 'chromium', 'brave', 'opera', 'code', 'slack',
+                           'discord', 'signal-desktop', 'obsidian', 'postman',
+                           'insomnia', 'teams-for-linux', 'spotify', 'telegram-desktop',
+                           'libreoffice'})
+_FLATPAK_OWN_ROW = frozenset({'org.mozilla.firefox', 'org.chromium.Chromium',
+                              'com.brave.Browser', 'com.google.Chrome', 'com.microsoft.Edge',
+                              'com.vivaldi.Vivaldi', 'app.zen_browser.zen',
+                              'io.gitlab.librewolf-community', 'com.visualstudio.code',
+                              'com.slack.Slack', 'com.discordapp.Discord', 'org.signal.Signal',
+                              'md.obsidian.Obsidian', 'com.spotify.Client',
+                              'org.telegram.desktop', 'com.valvesoftware.Steam',
+                              'org.libreoffice.LibreOffice'})
+
+
+async def _sandbox_caches(log: Callable[[str], None]) -> Result:
+    paths: list[str] = []
+    for base, own, subs in ((HOME / 'snap', _SNAP_OWN_ROW, ('common/.cache', 'current/.cache')),
+                            (HOME / '.var/app', _FLATPAK_OWN_ROW, ('cache',))):
+        with contextlib.suppress(OSError):
+            for app in os.scandir(base):
+                if app.name not in own and app.is_dir(follow_symlinks=False):
+                    paths += [str(Path(app.path, sub, '*')) for sub in subs]
+    return await _clean_paths(paths, log)
+
+
 # ── Root-only tasks ──────────────────────────────────────────────────────────
 def _needs_root(fn: Callable) -> Callable:
     async def run(log: Callable[[str], None]) -> Result:
@@ -460,15 +487,117 @@ async def _apt(log: Callable[[str], None]) -> Result:
                 freed += int(float(m.group(1).replace(',', '')) * _UNITS[m.group(2)])
 
     opts = ['-y', '-o', 'Dpkg::Options::=--force-confdef', '-o', 'Dpkg::Options::=--force-confold']
-    series = await _run_series([
+    cmds = [
         _root(['apt-get', 'update']),
         # full-upgrade, not upgrade: plain upgrade holds back anything whose
         # dependencies changed, which on Ubuntu is every kernel update.
         _root(['apt-get', 'full-upgrade', *opts]),
         _root(['apt-get', 'autoremove', '--purge', *opts]),
-        _root(['apt-get', 'autoclean', '-y']),
-    ], log, counted)
-    return Result(pkgs=pkgs, freed=freed, failed=bool(series.failures),
+    ]
+    # Packages removed without --purge leave their config behind in state
+    # "rc"; nothing uses it, and it clutters every dpkg listing.
+    if residual := await asyncio.to_thread(_dpkg_residual):
+        cmds.append(_root(['apt-get', 'purge', *opts, *residual]))
+    series = await _run_series(cmds, log, counted)
+    freed += _dir_size('/var/cache/apt/archives')
+    # clean, not autoclean: the .debs are re-downloadable, and autoclean keeps
+    # every one still in the archive, which is nearly all of them.
+    clean = await _run_series([_root(['apt-get', 'clean'])], log)
+    first = series if series.failures else clean
+    notes = [_fail_note(first)] if first.failures else []
+    if residual:
+        notes.append(f'{len(residual)} residual configs')
+    if Path('/run/reboot-required').exists():
+        notes.append('reboot required')
+    return Result(pkgs=pkgs, freed=freed if not clean.failures else 0,
+                  failed=bool(series.failures or clean.failures),
+                  note=' · '.join(n for n in notes if n), failed_cmd=first.cmd,
+                  failed_tail=first.tail)
+
+
+def _dpkg_residual() -> list[str]:
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        out = subprocess.run(['dpkg-query', '-W', '-f', '${db:Status-Abbrev} ${Package}\\n'],
+                             capture_output=True, text=True, timeout=60).stdout
+        return [line.split()[1] for line in out.splitlines()
+                if line.startswith('rc') and len(line.split()) == 2]
+    return []
+
+
+def _dir_size(path: str) -> int:
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            with contextlib.suppress(OSError):
+                total += os.lstat(os.path.join(root, f)).st_size
+    return total
+
+
+# fwupdmgr exits 2 for "nothing to do", which is the usual, healthy outcome.
+_FWUPD_NOTHING = 2
+
+
+async def _firmware(log: Callable[[str], None]) -> Result:
+    counter = _Count()
+
+    def counted(msg: str) -> None:
+        log(msg)
+        if re.match(r'^\s*(?:Successfully installed|Downloading .* for )', msg):
+            counter.n += 1
+
+    failures: list[tuple[str, list[str]]] = []
+    for cmd in (['fwupdmgr', 'refresh', '--force'],
+                ['fwupdmgr', 'update', '-y', '--no-reboot-check', '--offline']):
+        full = _root(cmd)
+        log(f'$ {" ".join(full)}')
+        tail: list[str] = []
+
+        def keep(msg: str) -> None:
+            counted(msg)
+            tail.append(msg)
+            del tail[:-FAIL_TAIL_LINES]
+
+        if await _run_cmd(full, keep) not in (0, _FWUPD_NOTHING):
+            failures.append((' '.join(full), list(tail)))
+    if failures:
+        cmd, tail = failures[0]
+        return Result(pkgs=counter.n, failed=True, note=f'failed: {cmd}',
+                      failed_cmd=cmd, failed_tail=tail)
+    note = 'staged for next boot' if counter.n else ''
+    return Result(pkgs=counter.n, note=note)
+
+
+# Root-owned leftovers: rotated logs (logrotate's .1/.gz generations),
+# systemd coredumps, apport crash files of every user, and snapd's download
+# cache (hardlinks to installed snaps — dropping them frees what nothing else
+# still links to). find prints each size before deleting it, so the task can
+# bill exactly what went.
+_ROOT_SWEEPS = [
+    ['/var/log', '-type', 'f', '(', '-name', '*.gz', '-o', '-name', '*.xz', '-o', '-name', '*.old',
+     '-o', '-regex', r'.*\.[0-9]+', ')'],
+    ['/var/lib/systemd/coredump', '-type', 'f'],
+    ['/var/crash', '-type', 'f'],
+    ['/var/lib/snapd/cache', '-type', 'f', '-links', '1'],
+]
+
+
+async def _root_sweep(log: Callable[[str], None]) -> Result:
+    freed = files = 0
+
+    def tally(msg: str) -> None:
+        nonlocal freed, files
+        if msg.isdigit():
+            freed += int(msg)
+            files += 1
+        else:
+            log(msg)
+
+    cmds = [_root(['find', *args, '-printf', '%s\\n', '-delete'])
+            for args in _ROOT_SWEEPS if Path(args[0]).is_dir()]
+    series = await _run_series(cmds, log, tally)
+    if freed or files:
+        log(f'freed {_size_str(freed)} · {files:,} files')
+    return Result(freed=freed, files=files, failed=bool(series.failures),
                   note=_fail_note(series), failed_cmd=series.cmd,
                   failed_tail=series.tail)
 
@@ -989,6 +1118,14 @@ def _user_owned(cmd: str) -> bool:
     return bool(path) and Path(path).resolve().is_relative_to(HOME)
 
 
+_RE_CARGO_UPD = re.compile(r'^Overall updated (\d+) packages?', re.I)
+
+
+def _m_cargo(line: str, c: _Count) -> None:
+    if m := _RE_CARGO_UPD.match(line):
+        c.n = int(m.group(1))
+
+
 def _m_flatpak(line: str, c: _Count) -> None:
     if _RE_FLATPAK.match(line):
         c.n += 1
@@ -1007,8 +1144,14 @@ ALL_TASKS: list[Task] = [
              timeout=SLOW_TIMEOUT, locks=('snap',)) if _has('snap') else None,
         _upgrade('flatpak', 'Flatpak', [['flatpak', 'update', '-y', '--noninteractive']],
                  matcher=_m_flatpak, locks=('flatpak',), timeout=SLOW_TIMEOUT),
+        Task('firmware', 'Firmware (fwupd)', 'Upgrades', _needs_root(_firmware),
+             timeout=SLOW_TIMEOUT) if _has('fwupdmgr') else None,
         Task('brew', 'Homebrew', 'Upgrades', _brew_upgrade,
              timeout=SLOW_TIMEOUT, locks=('brew',)) if _has('brew') else None,
+        _upgrade('cargo_bins', 'Cargo binaries', [['cargo', 'install-update', '-a']],
+                 matcher=_m_cargo, require=('cargo-install-update',), locks=('rust',)),
+        _upgrade('gh_ext', 'gh extensions', [['gh', 'extension', 'upgrade', '--all']],
+                 when=_has('gh') and any((HOME / '.local/share/gh/extensions').glob('*'))),
         _upgrade('omz', 'Oh My Zsh', [['zsh', '-f', str(_OMZ), '-v', 'minimal']],
                  matcher=_m_omz, require=('zsh',), when=_OMZ.is_file()),
         _upgrade('python', 'Python tools',
@@ -1037,10 +1180,13 @@ ALL_TASKS: list[Task] = [
     _path_task('incomplete', 'Incomplete Downloads',   'System', ['~/Downloads/*.crdownload', '~/Downloads/*.part']),
     _path_task('shellres',   'Shell History Residue',  'System', ['~/.zsh_history.bak*', '~/.zcompdump*']),
     Task('trash',     'Trash',                  'System', _empty_trash, locks=('dot-share',)),
+    Task('sandbox',   'Snap & Flatpak Caches',  'System', _sandbox_caches),
     Task('homesweep', '.DS_Store & Cruft',      'System', _home_sweep),
     *_collect(
         Task('journal', 'systemd Journal (30d)', 'System', _needs_root(_journal),
              timeout=CMD_TIMEOUT) if _has('journalctl') else None,
+        Task('rootsweep', 'Old Logs, Cores & Crashes', 'System', _needs_root(_root_sweep),
+             timeout=CMD_TIMEOUT) if _has('find') else None,
         Task('flatpak_cl', 'Flatpak Unused', 'System',
              lambda log: _simple_cmds([['flatpak', 'uninstall', '--unused', '-y',
                                         '--noninteractive']], log),

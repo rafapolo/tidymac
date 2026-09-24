@@ -165,13 +165,20 @@ deleting them does reduce what you can roll back to locally.
 
 ## Linux: `tidy`
 
-`tidylinux.py` is the Linux sibling: same engine and TUI, with a Linux task
-table — APT (`full-upgrade`, `autoremove`, `autoclean`), snaps (refresh plus
-dropping disabled revisions), Flatpak, the systemd journal, `~/.cache`,
-freedesktop Trash, and the native/snap/flatpak locations of browsers, editors
-and Electron apps.
+`tidylinux.py` is the Linux sibling, tuned for Ubuntu: same engine and TUI,
+with a Linux task table.
 
-APT, snaps and the journal need root. Run from a terminal, `tidy` asks for the
+- **Upgrades** — APT (`full-upgrade`, `autoremove --purge`, residual `rc`
+  configs purged, `apt-get clean`; flags when a reboot is required), snaps,
+  Flatpak, firmware via `fwupdmgr` (staged for next boot), `cargo
+  install-update`, `gh` extensions, plus the user-level tools tidymac knows.
+- **Cleanup** — snapd's disabled revisions, the systemd journal (30 days /
+  500 MB), rotated `/var/log` generations, coredumps, apport crashes, snapd's
+  download cache, `~/.cache`, per-snap and per-flatpak caches, freedesktop
+  Trash (also on mounted volumes), and the native/snap/flatpak locations of
+  browsers, editors and Electron apps.
+
+APT, snaps, firmware, the journal and the `/var` sweep need root. Run from a terminal, `tidy` asks for the
 sudo password once before the TUI starts; `--no-sudo` skips those tasks
 instead. `--install-agent` writes a weekly systemd user timer.
 
