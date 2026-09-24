@@ -6,9 +6,13 @@
   --snapshots      also thin Time Machine local snapshots (needs sudo)
   --no-report      skip the JSON run report
   --install-agent  write a weekly launchd agent and exit
+  --apps           report installed apps by size, last use and ~/Library data
+  --uninstall APP  move an app and everything it left in Library to the Trash
+  --orphans        find Library data whose app is no longer installed
+  --claude-history DAYS  also delete Claude Code transcripts older than DAYS
 '''
 from __future__ import annotations
-import argparse, asyncio, contextlib, json, os, re, signal, sys, time
+import argparse, asyncio, contextlib, json, os, plistlib, re, shlex, signal, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -603,9 +607,15 @@ async def _brew_upgrade(log: Callable[[str], None]) -> Result:
                   failed_tail=series.tail)
 
 
-async def _docker_prune(log: Callable[[str], None]) -> Result:
-    if await _run_cmd(['docker', 'info'], lambda _: None) != 0:
-        log('docker daemon not running, skipping')
+async def _container_prune(tool: str, log: Callable[[str], None]) -> Result:
+    '''`<tool> system prune -f` for docker or podman, crediting what it reports.
+
+    Both print the same "Total reclaimed space:" line. `info` doubles as the
+    liveness probe: with no daemon (or no podman machine) up, prune would
+    just fail.
+    '''
+    if await _run_cmd([tool, 'info'], lambda _: None) != 0:
+        log(f'{tool} is not running, skipping')
         return SKIPPED
     freed = 0
 
@@ -621,7 +631,7 @@ async def _docker_prune(log: Callable[[str], None]) -> Result:
                         freed = int(float(raw[: -len(suffix)].strip()) * mult)
                         break
 
-    await _run_cmd(['docker', 'system', 'prune', '-f'], _log)
+    await _run_cmd([tool, 'system', 'prune', '-f'], _log)
     return Result(freed=freed)
 
 
@@ -677,6 +687,403 @@ async def _simple_cmds(cmds: Sequence[Sequence[str]], log: Callable[[str], None]
     series = await _run_series(cmds, log)
     return Result(failed=bool(series.failures), note=_fail_note(series),
                   failed_cmd=series.cmd, failed_tail=series.tail)
+
+
+# ── Guarded sweeps & report-only scans ───────────────────────────────────────
+_DAY = 86400.0
+# --claude-history DAYS. Zero leaves Claude Code's session transcripts alone:
+# they are --resume history, not cache.
+CLAUDE_HISTORY_DAYS = 0
+
+
+async def _in_pool(fn: Callable):
+    return await asyncio.get_running_loop().run_in_executor(_IO_POOL, fn)
+
+
+def _newest_use(root: str, stop: float) -> float:
+    '''Latest mtime/atime anywhere under root, bailing out once past stop.
+
+    A directory's own mtime only moves when a direct child is added or
+    removed, so a cache busy three levels down still looks untouched from the
+    top. atime counts too: a model or video that is read but never rewritten
+    is still in use.
+    '''
+    newest = 0.0
+    stack = [root]
+    while stack:
+        cur = stack.pop()
+        try:
+            st = os.lstat(cur)
+        except OSError:
+            continue
+        newest = max(newest, st.st_mtime, st.st_atime)
+        if newest > stop:
+            return newest
+        if os.path.isdir(cur) and not os.path.islink(cur):
+            with contextlib.suppress(OSError), os.scandir(cur) as it:
+                stack.extend(e.path for e in it)
+    return newest
+
+
+def _dir_bytes(root: str) -> int:
+    total = 0
+    for dirpath, _, files in os.walk(root):
+        for name in files:
+            with contextlib.suppress(OSError):
+                total += os.lstat(os.path.join(dirpath, name)).st_size
+    return total
+
+
+def _found(items: list[tuple[int, str]], log: Callable[[str], None],
+           what: str, show: int = 10) -> Result:
+    '''Result for a report-only scan: log the biggest hits, delete nothing.'''
+    items.sort(reverse=True)
+    for size, label in items[:show]:
+        log(f'{_size_str(size):>9}  {label}')
+    if len(items) > show:
+        log(f'… and {len(items) - show} more')
+    if not items:
+        return Result(note='nothing found')
+    total = sum(size for size, _ in items)
+    return Result(note=f'{len(items)} {what} · {_size_str(total)} (not deleted)')
+
+
+# Editor extension roots → the app whose running process rewrites .obsolete.
+_EDITOR_EXT_DIRS = (
+    ('~/.vscode/extensions', 'Visual Studio Code.app'),
+    ('~/.vscode-insiders/extensions', 'Visual Studio Code - Insiders.app'),
+    ('~/.vscode-oss/extensions', 'VSCodium.app'),
+    ('~/.cursor/extensions', 'Cursor.app'),
+    ('~/.windsurf/extensions', 'Windsurf.app'),
+)
+
+
+def _app_running(bundle: str) -> bool:
+    import subprocess
+    try:
+        return subprocess.run(['pgrep', '-f', f'/{bundle}/'], capture_output=True,
+                              timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return True  # can't tell: assume it is, and leave its files alone
+
+
+async def _clean_obsolete_extensions(log: Callable[[str], None]) -> Result:
+    '''Extension versions VS Code and its forks have themselves marked obsolete.
+
+    Each update leaves the old folder behind, listed in extensions/.obsolete
+    for deletion at some later start that often never comes. Only names in
+    that list go — guessing "older" from version strings would also hit
+    side-by-side builds the editor still loads — and never while the editor
+    runs, since it rewrites that file on exit.
+    '''
+    def _do() -> tuple[int, int, list[str]]:
+        freed = count = 0
+        notes: list[str] = []
+        for root, bundle in _EDITOR_EXT_DIRS:
+            base = _expand(root)
+            try:
+                names = json.loads((base / '.obsolete').read_text())
+            except (OSError, ValueError):
+                continue
+            if not isinstance(names, dict):
+                continue
+            if _app_running(bundle):
+                notes.append(f'{bundle} is running, skipped {root}')
+                continue
+            for name in names:
+                target = base / name
+                # Keys are bare folder names; anything else is not ours to follow.
+                if '/' in name or name.startswith('.') or target.is_symlink() \
+                        or not target.is_dir():
+                    continue
+                f, c = _purge_tree(str(target))
+                freed += f
+                count += c
+                notes.append(f'{root}/{name}')
+        return freed, count, notes
+
+    freed, count, notes = await _in_pool(_do)
+    for line in notes:
+        log(line)
+    return Result(freed=freed, files=count)
+
+
+_WALLPAPER = HOME / 'Library/Application Support/com.apple.wallpaper'
+
+
+async def _clean_aerials(log: Callable[[str], None]) -> Result:
+    '''Downloaded aerial videos (~500 MB each) no wallpaper or screen saver uses.
+
+    Kept: any video whose asset ID the wallpaper store mentions, and any
+    played in the last 30 days, which covers "default" choices that name no
+    asset. If the store can't be read, nothing goes. macOS downloads an
+    aerial again whenever it is next picked.
+    '''
+    def _do() -> tuple[int, int, list[str]]:
+        store = _WALLPAPER / 'Store/Index.plist'
+        try:
+            # Raw bytes on purpose: the asset IDs sit inside nested binary
+            # plists, and a substring test survives format changes that a
+            # structural walk would not.
+            referenced = store.read_bytes().upper()
+        except OSError:
+            return 0, 0, ['wallpaper store unreadable, keeping every aerial']
+        cutoff = time.time() - 30 * _DAY
+        freed = count = 0
+        kept: list[str] = []
+        for video in (_WALLPAPER / 'aerials/videos').glob('*.mov'):
+            try:
+                st = video.lstat()
+            except OSError:
+                continue
+            if video.stem.upper().encode() in referenced:
+                kept.append(f'kept {video.name} (selected)')
+                continue
+            if max(st.st_atime, st.st_mtime) > cutoff:
+                kept.append(f'kept {video.name} (played recently)')
+                continue
+            f, c = _remove_entry(video)
+            freed += f
+            count += c
+        return freed, count, kept
+
+    freed, count, notes = await _in_pool(_do)
+    for line in notes:
+        log(line)
+    return Result(freed=freed, files=count)
+
+
+# ~/.cache entries a dedicated task already handles (some deliberately gently:
+# uv is pruned, never wiped), plus model stores — downloaded weights are data
+# that costs gigabytes to fetch again, not cache.
+_DOT_CACHE_KEEP = frozenset({
+    'esbuild', 'gh', 'huggingface', 'lm-studio', 'nvim', 'nx', 'ollama',
+    'org.swift.swiftpm', 'pre-commit', 'puppeteer', 'torch', 'uv', 'vite',
+    'webpack', 'whisper', 'yt-dlp', 'zed', 'zig',
+})
+
+
+async def _clean_stale_dot_cache(log: Callable[[str], None]) -> Result:
+    '''~/.cache directories nothing has touched in 30 days, judged deep.'''
+    def _do() -> tuple[int, int, list[str]]:
+        base = HOME / '.cache'
+        cutoff = time.time() - 30 * _DAY
+        freed = count = 0
+        gone: list[str] = []
+        entries: list[os.DirEntry] = []
+        with contextlib.suppress(OSError), os.scandir(base) as it:
+            entries = [e for e in it if e.name not in _DOT_CACHE_KEEP
+                       and e.is_dir(follow_symlinks=False)]
+        for e in entries:
+            if _newest_use(e.path, cutoff) > cutoff:
+                continue
+            f, c = _purge_tree(e.path)
+            freed += f
+            count += c
+            gone.append(f'{e.name}: {_size_str(f)}')
+        return freed, count, gone
+
+    freed, count, notes = await _in_pool(_do)
+    for line in notes:
+        log(line)
+    return Result(freed=freed, files=count)
+
+
+_CLAUDE = HOME / '.claude'
+_RE_SESSION = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+
+
+def _claude_recent_sessions(cutoff: float) -> set[str]:
+    '''IDs of sessions whose transcript moved since cutoff — possibly live.'''
+    recent = set()
+    for jsonl in (_CLAUDE / 'projects').glob('*/*.jsonl'):
+        with contextlib.suppress(OSError):
+            if jsonl.stat().st_mtime > cutoff:
+                recent.add(jsonl.stem)
+    return recent
+
+
+async def _clean_claude_state(log: Callable[[str], None]) -> Result:
+    '''Claude Code's per-session scratch: debug logs, shell snapshots, paste
+    cache, todos and /rewind file history.
+
+    Live sessions read these, so anything tied to a session whose transcript
+    moved in the last 30 days stays, and the rest must itself be 30 days old.
+    '''
+    def _do() -> tuple[int, int]:
+        cutoff = time.time() - 30 * _DAY
+        recent = _claude_recent_sessions(cutoff)
+        freed = count = 0
+        for sub in ('debug', 'file-history', 'paste-cache', 'shell-snapshots', 'todos'):
+            with contextlib.suppress(OSError), os.scandir(_CLAUDE / sub) as it:
+                for e in list(it):
+                    m = _RE_SESSION.match(e.name)
+                    if m and m.group(0) in recent:
+                        continue
+                    if _newest_use(e.path, cutoff) > cutoff:
+                        continue
+                    f, c = _remove_entry(Path(e.path))
+                    freed += f
+                    count += c
+        return freed, count
+
+    freed, count = await _to_thread(_do)
+    if freed or count:
+        log(f'freed {_size_str(freed)} · {count:,} files')
+    return Result(freed=freed, files=count)
+
+
+async def _clean_claude_history(log: Callable[[str], None]) -> Result:
+    '''Session transcripts (--resume history) older than --claude-history days.
+
+    Only session-named entries go — each project's memory/ directory stays.
+    Claude Code has its own knob for this too: cleanupPeriodDays in
+    ~/.claude/settings.json.
+    '''
+    def _do() -> tuple[int, int]:
+        cutoff = time.time() - CLAUDE_HISTORY_DAYS * _DAY
+        freed = count = 0
+        for entry in (_CLAUDE / 'projects').glob('*/*'):
+            if not _RE_SESSION.match(entry.name):
+                continue
+            if _newest_use(str(entry), cutoff) > cutoff:
+                continue
+            f, c = _remove_entry(entry)
+            freed += f
+            count += c
+        return freed, count
+
+    freed, count = await _to_thread(_do)
+    if freed or count:
+        log(f'freed {_size_str(freed)} · {count:,} files')
+    return Result(freed=freed, files=count)
+
+
+def _claude_history_task() -> Task:
+    return Task('claudehist', f'Claude Transcripts ({CLAUDE_HISTORY_DAYS}d+)',
+                'Dev — Other', _clean_claude_history)
+
+
+async def _sim_runtimes(log: Callable[[str], None]) -> Result:
+    '''Unavailable simulators, then runtime images unused for 90 days.'''
+    res = await _simple_cmds([['xcrun', 'simctl', 'delete', 'unavailable']], log)
+    quiet = False
+
+    def _log(msg: str) -> None:
+        nonlocal quiet
+        log(msg)
+        quiet |= 'no matching images' in msg.lower()
+
+    rc = await _run_cmd(['xcrun', 'simctl', 'runtime', 'delete',
+                         '--notUsedSinceDays', '90'], _log)
+    # Exit 2 with "No matching images" just means nothing was old enough.
+    if rc and not (rc == 2 and quiet):
+        res.failed = True
+        res.note = res.note or 'failed: simctl runtime delete'
+    return res
+
+
+def _self_updating(tool: str) -> bool:
+    '''True if tool is on PATH and did not come from Homebrew.
+
+    The Homebrew task already upgrades brew-installed copies, and a
+    self-update would overwrite a file brew owns and thinks it knows.
+    '''
+    import shutil
+    path = shutil.which(tool)
+    if not path:
+        return False
+    real = os.path.realpath(path)
+    return '/Cellar/' not in real and '/Caskroom/' not in real
+
+
+def _editor_clis() -> list[list[str]]:
+    '''`<editor> --update-extensions` for each installed VS Code-family app.'''
+    cmds = []
+    for app, cli in (('Visual Studio Code.app', 'code'), ('Cursor.app', 'cursor'),
+                     ('Windsurf.app', 'windsurf'), ('VSCodium.app', 'codium')):
+        for d in _APP_DIRS:
+            path = Path(d, app, 'Contents/Resources/app/bin', cli)
+            if os.access(path, os.X_OK):
+                cmds.append([str(path), '--update-extensions'])
+                break
+    return cmds
+
+
+async def _report_node_modules(log: Callable[[str], None]) -> Result:
+    '''node_modules in projects nobody has installed into for 90 days.'''
+    def _do() -> list[tuple[int, str]]:
+        cutoff = time.time() - 90 * _DAY
+        hits = []
+        skip = _WALK_SKIP - {'node_modules'}
+        for root, dirnames, _ in os.walk(HOME):
+            if 'node_modules' in dirnames:
+                nm = os.path.join(root, 'node_modules')
+                stamps = [nm] + [os.path.join(root, f) for f in
+                                 ('package.json', 'package-lock.json',
+                                  'pnpm-lock.yaml', 'yarn.lock', 'bun.lockb')]
+                newest = 0.0
+                for p in stamps:
+                    with contextlib.suppress(OSError):
+                        newest = max(newest, os.lstat(p).st_mtime)
+                if newest and newest < cutoff:
+                    hits.append((_dir_bytes(nm), root.replace(HOME_STR, '~', 1)))
+            # Hidden dirs hold tools, not projects: editor extensions ship
+            # their own node_modules, and those are the editor's business.
+            dirnames[:] = [d for d in dirnames if d not in skip and not d.startswith('.')
+                           and d != 'node_modules' and not d.endswith(_BUNDLE_SUFFIXES)]
+        return hits
+
+    return _found(await _in_pool(_do), log, 'stale node_modules')
+
+
+async def _report_ios_backups(log: Callable[[str], None]) -> Result:
+    '''iPhone/iPad backups. Never deleted: they may be the only copy.'''
+    base = HOME / 'Library/Application Support/MobileSync/Backup'
+
+    def _do() -> list[tuple[int, str]] | None:
+        try:
+            entries = list(base.iterdir())
+        except PermissionError:
+            return None
+        except OSError:
+            return []
+        return [(_dir_bytes(str(e)),
+                 f'{e.name[:12]}…  last backup {time.strftime("%Y-%m-%d", time.localtime(e.stat().st_mtime))}')
+                for e in entries if e.is_dir()]
+
+    items = await _in_pool(_do)
+    if items is None:
+        return Result(note='needs Full Disk Access to size')
+    return _found(items, log, 'device backups')
+
+
+async def _report_downloads(log: Callable[[str], None]) -> Result:
+    '''Files over 500 MB in ~/Downloads untouched for 30 days.'''
+    def _do() -> list[tuple[int, str]]:
+        cutoff = time.time() - 30 * _DAY
+        hits = []
+        for root, dirnames, files in os.walk(HOME / 'Downloads'):
+            dirnames[:] = [d for d in dirnames if not d.endswith(_BUNDLE_SUFFIXES)]
+            for name in files:
+                with contextlib.suppress(OSError):
+                    st = os.lstat(os.path.join(root, name))
+                    if st.st_size >= 500 << 20 and max(st.st_mtime, st.st_atime) < cutoff:
+                        hits.append((st.st_size, os.path.join(root, name)
+                                     .replace(HOME_STR, '~', 1)))
+        return hits
+
+    return _found(await _in_pool(_do), log, 'big old downloads')
+
+
+async def _report_installers(log: Callable[[str], None]) -> Result:
+    '''macOS installer apps. Often kept on purpose for bootable USB installers.'''
+    def _do() -> list[tuple[int, str]]:
+        return [(_dir_bytes(str(p)), str(p)) for d in _APP_DIRS
+                for p in Path(d).glob('Install macOS *.app')]
+
+    return _found(await _in_pool(_do), log, 'macOS installers')
 
 
 # ── Task table ───────────────────────────────────────────────────────────────
@@ -889,6 +1296,28 @@ async def _thin_snapshots(log: Callable[[str], None]) -> Result:
                   note=f'{deleted}/{len(dates)} snapshots deleted')
 
 
+async def _snapshot_hint(totals: dict) -> str:
+    '''Explain a run that freed gigabytes but left the free-space number flat.
+
+    Blocks a local snapshot still references stay allocated after the files
+    are deleted, so the disk only gives the space back once the snapshots age
+    out (macOS thins them within about a day, or sooner under pressure).
+    '''
+    if DRY_RUN or totals['freed'] < 1073741824 or totals['disk_freed'] * 2 > totals['freed']:
+        return ''
+    dates: list[str] = []
+
+    def _collect(msg: str) -> None:
+        if m := _RE_SNAPSHOT.search(msg):
+            dates.append(m.group(1))
+
+    await _run_cmd(['tmutil', 'listlocalsnapshots', '/'], _collect)
+    if not dates:
+        return ''
+    return (f'{len(dates)} Time Machine local snapshots still hold the freed space; '
+            'macOS releases it within about a day, or re-run with --snapshots')
+
+
 def _snapshots_task() -> Task:
     return Task('snapshots', 'TM Local Snapshots', 'System', _thin_snapshots,
                 timeout=SLOW_TIMEOUT)
@@ -924,6 +1353,24 @@ ALL_TASKS: list[Task] = [
                  matcher=_m_gem, locks=('gem',)),
         _upgrade('macos', 'macOS updates', [['softwareupdate', '-ia']],
                  matcher=_m_swu, timeout=SLOW_TIMEOUT),
+        # Self-updaters, only for copies Homebrew doesn't own. `claude update`
+        # swaps the binary under running sessions; they keep the old one
+        # until restarted, which is fine.
+        _upgrade('claude', 'Claude Code CLI', [['claude', 'update']],
+                 when=_self_updating('claude')),
+        _upgrade('bunup', 'Bun', [['bun', 'upgrade']], when=_self_updating('bun')),
+        _upgrade('denoup', 'Deno', [['deno', 'upgrade']], when=_self_updating('deno')),
+        _upgrade('mise', 'mise tools',
+                 [['mise', 'upgrade']]
+                 + ([['mise', 'self-update', '--yes']] if _self_updating('mise') else []),
+                 locks=('mise',)),
+        _upgrade('asdf', 'asdf plugins', [['asdf', 'plugin', 'update', '--all']]),
+        _upgrade('gcloud', 'gcloud components', [['gcloud', 'components', 'update', '--quiet']]),
+        # Left out on purpose: `flutter upgrade` can break projects pinned to
+        # a channel or version.
+        _upgrade('editorext', 'Editor extensions', _editor_clis(),
+                 require=tuple(c[0] for c in _editor_clis()),
+                 when=bool(_editor_clis())),
     ),
     # ── System ───────────────────────────────────────────────────────────────
     _path_task('caches',     'User Caches',           'System', ['~/Library/Caches/*']),
@@ -949,12 +1396,22 @@ ALL_TASKS: list[Task] = [
     _path_task('appsupcache', 'App Support Caches',    'System', ['~/Library/Application Support/Caches/*']),
     _path_task('ipsw',        'Device Software Updates','System', ['~/Library/iTunes/iPhone Software Updates/*', '~/Library/iTunes/iPad Software Updates/*']),
     *_collect(
+        Task('aerials', 'Unused Aerial Videos', 'System', _clean_aerials,
+             locks=('app-support',)) if (_WALLPAPER / 'aerials/videos').is_dir() else None,
+        Task('dotcache', 'Stale ~/.cache (30d+)', 'System', _clean_stale_dot_cache,
+             locks=('dot-cache',)) if (HOME / '.cache').is_dir() else None,
+    ),
+    *_collect(
         Task('brew_cl', 'Homebrew Cleanup', 'System',
              lambda log: _simple_cmds([['brew', 'cleanup', '--prune=all'],
                                        ['brew', 'autoremove']], log),
              timeout=CMD_TIMEOUT, locks=('brew',)) if _has('brew') else None,
-        Task('docker', 'Docker Prune', 'System', _docker_prune,
+        Task('docker', 'Docker Prune', 'System',
+             lambda log: _container_prune('docker', log),
              timeout=CMD_TIMEOUT) if _has('docker') else None,
+        Task('podman', 'Podman Prune', 'System',
+             lambda log: _container_prune('podman', log),
+             timeout=CMD_TIMEOUT) if _has('podman') else None,
     ),
     Task('dns', 'DNS Cache', 'System',
          lambda log: _simple_cmds([['dscacheutil', '-flushcache']], log)),
@@ -981,6 +1438,9 @@ ALL_TASKS: list[Task] = [
         _app_task('librewolf','LibreWolf','Browsers', ['~/Library/Caches/LibreWolf/Profiles/*/cache2/*'],                            '/Applications/LibreWolf.app'),
         _app_task('tor',      'Tor Browser','Browsers', ['~/Library/Caches/TorBrowser-Data/Browser/Caches/*'],                       '/Applications/Tor Browser.app'),
         _app_task('orion',    'Orion',    'Browsers', ['~/Library/Caches/com.kagi.kagimacOS/*'],                                     '/Applications/Orion.app'),
+        # Chrome's updater keeps every extension/component download it has
+        # fetched; losing it only means full rather than delta downloads.
+        _dir_task('gupdater', 'Google Updater cache', 'Browsers', ['~/Library/Application Support/Google/GoogleUpdater/crx_cache/*'], '~/Library/Application Support/Google/GoogleUpdater/crx_cache'),
     ),
     # ── Dev — JS/Node ────────────────────────────────────────────────────────
     *_collect(
@@ -1079,6 +1539,8 @@ ALL_TASKS: list[Task] = [
         _dir_task('ytdlp',     'yt-dlp',      'Dev — Other', ['~/.cache/yt-dlp/*'],                      '~/.cache/yt-dlp'),
         _dir_task('ollamalog', 'Ollama logs', 'Dev — Other', ['~/.ollama/logs/*'],                       '~/.ollama/logs'),
         _dir_task('claudecli', 'Claude Code', 'Dev — Other', ['~/Library/Caches/claude-cli-nodejs/*'],   '~/Library/Caches/claude-cli-nodejs'),
+        Task('claudestate', 'Claude Code state (30d+)', 'Dev — Other',
+             _clean_claude_state) if _CLAUDE.is_dir() else None,
     ),
     # ── IDEs & Editors ───────────────────────────────────────────────────────
     *_collect(
@@ -1090,9 +1552,10 @@ ALL_TASKS: list[Task] = [
         _app_task('xcodedevsup','Xcode Device Support','IDEs & Editors', ['~/Library/Developer/Xcode/iOS DeviceSupport/*', '~/Library/Developer/Xcode/watchOS DeviceSupport/*', '~/Library/Developer/Xcode/tvOS DeviceSupport/*'], '/Applications/Xcode.app'),
         _app_task('xcodecache','Xcode Caches',       'IDEs & Editors', ['~/Library/Caches/com.apple.dt.Xcode/*'],          '/Applications/Xcode.app'),
         _app_task('simulator', 'iOS Simulator',     'IDEs & Editors', ['~/Library/Developer/CoreSimulator/Caches/*'],     '/Applications/Xcode.app'),
-        Task('sim_runtimes', 'Sim Runtimes (unused)', 'IDEs & Editors',
-             lambda log: _simple_cmds([['xcrun', 'simctl', 'delete', 'unavailable']], log),
+        Task('sim_runtimes', 'Sim Runtimes (unused)', 'IDEs & Editors', _sim_runtimes,
              timeout=CMD_TIMEOUT) if _has('xcrun') else None,
+        Task('extobsolete', 'Obsolete Extensions', 'IDEs & Editors', _clean_obsolete_extensions)
+        if any(_expand(root).joinpath('.obsolete').is_file() for root, _ in _EDITOR_EXT_DIRS) else None,
         Task('androidstudio', 'Android Studio', 'IDEs & Editors',
              lambda log: _clean_paths(
                  [str(p / '*') for p in (HOME / 'Library/Caches/Google').glob('AndroidStudio*/')]
@@ -1143,6 +1606,12 @@ ALL_TASKS: list[Task] = [
         _app_task('utm',           'UTM',              'Apps', ['~/Library/Containers/com.utmapp.UTM/Data/Library/Caches/*'],                       '/Applications/UTM.app'),
         _app_task('libreoffice',   'LibreOffice',      'Apps', ['~/Library/Application Support/LibreOffice/4/cache/*'],                             '/Applications/LibreOffice.app'),
     ),
+    # ── Report only ──────────────────────────────────────────────────────────
+    # Big, and not ours to delete: listed in the log and report, left in place.
+    Task('rep_nodemods',  'Stale node_modules (90d)', 'Report only', _report_node_modules),
+    Task('rep_backups',   'iOS Device Backups',       'Report only', _report_ios_backups),
+    Task('rep_downloads', 'Big Old Downloads',        'Report only', _report_downloads),
+    Task('rep_installers','macOS Installers',         'Report only', _report_installers),
 ]
 
 # ── Theme ────────────────────────────────────────────────────────────────────
@@ -1444,6 +1913,10 @@ class TidymacApp(App[None]):
             self._stream = None
         if report := _write_report(self._records, totals):
             log_widget.write(f'report: {report}')
+        for line in _vs_last_run(self._records, report):
+            log_widget.write(line)
+        if hint := await _snapshot_hint(totals):
+            log_widget.write(hint)
         await _notify(summary)
 
 
@@ -1532,6 +2005,39 @@ def _summary_line(totals: dict) -> str:
     return '  ·  '.join(parts)
 
 
+def _vs_last_run(records: list[dict], current: Path | None) -> list[str]:
+    '''Compare this run with the previous one of the same kind.
+
+    Dry runs compare only with dry runs: a real run always "frees" less than
+    the dry run before it, which says nothing. The biggest growers are what
+    fills the disk between runs, so they're worth naming.
+    '''
+    prev = None
+    for path in sorted(REPORT_DIR.glob('20*.json'), reverse=True):
+        if path == current:
+            continue
+        with contextlib.suppress(OSError, ValueError):
+            data = json.loads(path.read_text())
+            if data.get('dry_run') == DRY_RUN:
+                prev = data
+                break
+    if not prev:
+        return []
+    before = {t['id']: t.get('freed', 0) for t in prev.get('tasks', [])}
+    freed = sum(r['freed'] for r in records)
+    was = prev.get('totals', {}).get('freed', 0)
+    delta = freed - was
+    sign = '+' if delta >= 0 else '-'
+    lines = [f'vs last run ({prev.get("started", "?")[:10]}): '
+             f'{_size_str(freed)} freed, {sign}{_size_str(abs(delta))}']
+    growers = sorted(((r['freed'] - before.get(r['id'], 0), r['name'])
+                      for r in records), reverse=True)[:3]
+    grew = [f'{name} +{_size_str(d)}' for d, name in growers if d >= 50 << 20]
+    if grew:
+        lines.append('grew most: ' + ', '.join(grew))
+    return lines
+
+
 async def _notify(text: str) -> None:
     safe = (text or 'Finished').replace('"', "'").replace('\\', '')
     title = 'tidymac' + (' (dry run)' if DRY_RUN else '')
@@ -1586,8 +2092,515 @@ async def run_headless() -> int:
     print('\nDone' + (f'  ·  {summary}' if summary else ''))
     if report := _write_report(records, totals):
         print(f'report: {report}')
+    for line in _vs_last_run(records, report):
+        print(line)
+    if hint := await _snapshot_hint(totals):
+        print(hint)
     await _notify(summary)
     return 1 if totals['failed'] else 0
+
+
+# ── Apps: report, uninstall, orphans ─────────────────────────────────────────
+# Dragging an app to the Trash leaves its Library data behind, often more than
+# the app itself. These modes find that data by bundle id and move it to the
+# Trash (never unlink: Put Back is the undo), one-shot rather than a parallel
+# task because each one asks before it touches anything.
+UNUSED_DAYS = 90
+
+# (directory, may an entry there be named after the app instead of its id)
+_LEFTOVER_DIRS: tuple[tuple[str, bool], ...] = (
+    ('~/Library/Application Support', True),
+    ('~/Library/Application Support/FileProvider', False),
+    ('~/Library/Application Support/com.apple.sharedfilelist/'
+     'com.apple.LSSharedFileList.ApplicationRecentDocuments', False),
+    ('~/Library/Application Scripts', False),
+    ('~/Library/Caches', True),
+    ('~/Library/Containers', False),
+    ('~/Library/Cookies', False),
+    ('~/Library/Group Containers', False),
+    ('~/Library/HTTPStorages', False),
+    ('~/Library/LaunchAgents', False),
+    ('~/Library/Logs', True),
+    ('~/Library/Preferences', False),
+    ('~/Library/Preferences/ByHost', False),
+    ('~/Library/Saved Application State', False),
+    ('~/Library/WebKit', False),
+    ('/Library/Application Support', True),
+    ('/Library/Caches', False),
+    ('/Library/LaunchAgents', False),
+    ('/Library/LaunchDaemons', False),
+    ('/Library/Logs', True),
+    ('/Library/Preferences', False),
+    ('/Library/PrivilegedHelperTools', False),
+)
+
+# Only an app or its extension ever writes here. Preferences and Caches also
+# collect CLI tools' ids, so an unowned id there proves nothing; an unowned id
+# here is an app that's gone. HTTPStorages and WebKit are out for the same
+# reason: CLI tools with an embedded bundle id (Playwright's WebKit, compiled
+# Bun/Swift binaries) write there too.
+_ORPHAN_EVIDENCE = frozenset({
+    '~/Library/Application Scripts',
+    '~/Library/Application Support/com.apple.sharedfilelist/'
+    'com.apple.LSSharedFileList.ApplicationRecentDocuments',
+    '~/Library/Containers',
+    '~/Library/Saved Application State',
+})
+
+# Editors that keep extensions in a home dot-dir rather than Library, keyed by
+# the app name (lowercase) that owns it. ~/.cursor alone can run to gigabytes.
+_DOT_DIRS = {
+    '.cursor': 'cursor',
+    '.vscode': 'visual studio code',
+    '.vscode-insiders': 'visual studio code - insiders',
+    '.windsurf': 'windsurf',
+}
+
+_ID_SUFFIXES = ('.plist', '.binarycookies', '.savedstate', '.sfl2', '.sfl3', '.sfl4')
+_RE_TEAM = re.compile(r'^[A-Z0-9]{10}\.')
+_RE_BUNDLE_ID = re.compile(r'^[a-z0-9-]+(\.[a-z0-9_-]+){2,}$')
+
+
+@dataclass(slots=True)
+class _App:
+    path: Path
+    bid: str                 # lowercase
+    names: frozenset[str]    # lowercase bundle stem and CFBundleName
+    size: int = 0
+    data: int = 0            # bytes of leftovers in Library
+    last_used: float | None = None
+
+
+def _read_app(path: Path) -> _App | None:
+    try:
+        with (path / 'Contents/Info.plist').open('rb') as fh:
+            info = plistlib.load(fh)
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return None
+    # Not CFBundleExecutable: Claude Code's URL handler runs a binary called
+    # `claude`, which would claim the Claude app's Application Support folder.
+    names = {path.stem, info.get('CFBundleName')}
+    return _App(path, str(info.get('CFBundleIdentifier') or '').lower(),
+                frozenset(n.lower() for n in names if isinstance(n, str) and len(n) >= 3))
+
+
+def _user_apps() -> list[_App]:
+    '''Removable apps: /Applications and ~/Applications, one folder deep.'''
+    found: list[_App] = []
+    for base in (Path('/Applications'), HOME / 'Applications'):
+        try:
+            entries = list(base.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.suffix == '.app':
+                candidates = [entry]
+            elif entry.is_dir() and not entry.is_symlink():
+                candidates = [p for p in entry.glob('*.app')]
+            else:
+                continue
+            for path in candidates:
+                # Safari and friends are firmlinks into the sealed system volume.
+                if path.is_symlink() or not (app := _read_app(path)) or not app.bid:
+                    continue
+                found.append(app)
+    return found
+
+
+_NESTED_BUNDLES = (
+    'Contents/*/*.app', 'Contents/*/*/*.app', 'Contents/*/*/*/*/*.app',
+    'Contents/PlugIns/*.appex', 'Contents/Library/*/*.appex',
+)
+
+# An id whose app-only data changed this recently is still in use by
+# something, even if that something isn't a bundle we can find.
+ORPHAN_QUIET_DAYS = 7
+
+
+def _installed_ids() -> set[str]:
+    '''Bundle ids of every app on the machine, not just the removable ones.
+
+    Spotlight finds apps anywhere (~/Downloads, other volumes, helpers);
+    the app folders are walked too in case indexing is off for them.
+    '''
+    paths = {str(a.path) for a in _user_apps()}
+    # Helpers and extensions nested in an app have ids of their own (Docker's
+    # login item is com.docker.helper), and Spotlight doesn't index inside bundles.
+    for app in list(paths):
+        for pattern in _NESTED_BUNDLES:
+            with contextlib.suppress(OSError, ValueError):
+                paths.update(str(p) for p in Path(app).glob(pattern))
+    for base in ('/System/Applications', '/System/Library/CoreServices'):
+        with contextlib.suppress(OSError):
+            paths.update(str(p) for p in Path(base).rglob('*.app'))
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        out = subprocess.run(
+            ['mdfind', 'kMDItemContentType == "com.apple.application-bundle"'],
+            capture_output=True, text=True, timeout=60).stdout
+        paths.update(line for line in out.splitlines() if line.endswith('.app'))
+    ids = set()
+    for p in paths:
+        if (app := _read_app(Path(p))) and app.bid:
+            ids.add(app.bid)
+    return ids
+
+
+def _entry_key(name: str) -> tuple[str, bool]:
+    '''(the bundle id an entry is named for, whether it carried a team prefix).'''
+    key = name.lower()
+    for suffix in _ID_SUFFIXES:
+        if key.endswith(suffix):
+            key = key[:-len(suffix)]
+            break
+    team = bool(_RE_TEAM.match(name))
+    if team:
+        key = key[11:]
+    return key.removeprefix('group.'), team
+
+
+# macOS's own data, including ids Apple kept from apps it bought (Workflow
+# became Shortcuts). Never an orphan, never a leftover.
+_APPLE_IDS = ('com.apple.', 'is.workflow.', 'systemgroup.')
+
+
+def _product_owned(key: str, ids: Iterable[str], names: Iterable[str]) -> bool:
+    '''Whether an installed app plausibly owns key, by id or by product name.
+
+    Far looser than _owner, on purpose: calling an app gone is the costly
+    mistake. Microsoft AutoUpdate is com.microsoft.autoupdate2 yet caches as
+    com.microsoft.autoupdate.fba; MonitorControl moved from me.guillaumeb to
+    app.monitorcontrol; Docker Desktop also writes com.electron.dockerdesktop.
+    '''
+    parts = key.split('.')
+    root = '.'.join(parts[:3])
+    if any(bid.startswith(root) or key.startswith(bid) for bid in ids):
+        return True
+    product = parts[2] if len(parts) > 2 else ''
+    return any(product.startswith(n) for n in names)
+
+
+def _owner(key: str, ids: Iterable[str]) -> str:
+    '''The most specific bundle id that key belongs to, or ''.
+
+    Prefix, not equality: com.microsoft.OneDriveUpdater and
+    com.microsoft.OneDrive.FileProvider are OneDrive's. Longest wins, so
+    com.google.Chrome.canary stays Canary's while Canary is installed.
+    '''
+    best = ''
+    for bid in ids:
+        if len(bid) > len(best) and key.startswith(bid):
+            best = bid
+    return best
+
+
+_NESTED = '~/Library/Application Support/*'  # vendor folders: Google/Chrome
+
+
+def _library_entries() -> list[tuple[Path, str, bool]]:
+    '''Every candidate leftover: (path, its leftover dir, may it match by name).
+
+    Application Support is also read one level down, where vendors nest their
+    apps (Google/Chrome); those entries match by app name only.
+    '''
+    out = []
+    for base, by_name in _LEFTOVER_DIRS:
+        try:
+            for entry in _expand(base).iterdir():
+                out.append((entry, base, by_name))
+        except OSError:
+            continue
+    for vendor in list(_expand('~/Library/Application Support').iterdir()):
+        if vendor.is_dir() and not vendor.is_symlink():
+            with contextlib.suppress(OSError):
+                out.extend((entry, _NESTED, True) for entry in vendor.iterdir())
+    return out
+
+
+def _leftovers(app: _App, ids: set[str], entries: list[tuple[Path, str, bool]],
+               other_names: set[str] = frozenset()) -> list[Path]:
+    '''What app left in Library. other_names are the names of every other
+    installed app: a folder two apps could both claim by name is neither's.'''
+    others = ids - {app.bid}
+    names = app.names - other_names
+    nospace = {n.replace(' ', '') for n in names if len(n) >= 5}
+    found = []
+    for path, base, by_name in entries:
+        key, team = _entry_key(path.name)
+        if key.startswith(_APPLE_IDS):
+            continue
+        owner = '' if base == _NESTED else _owner(key, others | {app.bid})
+        if owner == app.bid:
+            found.append(path)
+        elif owner:
+            continue  # another installed app's, however the name reads
+        elif by_name and path.name.lower() in names:
+            found.append(path)
+        elif team and any(key.startswith(n) for n in nospace):
+            found.append(path)  # UBF8T346G9.OneDriveStandaloneSuite
+    for dot, owner_name in _DOT_DIRS.items():
+        if owner_name in app.names and (HOME / dot).is_dir():
+            found.append(HOME / dot)
+    # A nested match inside a folder already taken would be counted twice.
+    return [p for p in found if not any(q != p and q in p.parents for q in found)]
+
+
+def _tree_size(path: Path) -> int:
+    '''Allocated bytes, like du: Docker's sparse disk image advertises
+    hundreds of GB it doesn't use, and APFS compression shrinks the rest.'''
+    try:
+        if path.is_symlink() or not path.is_dir():
+            return path.lstat().st_blocks * 512
+    except OSError:
+        return 0
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            with contextlib.suppress(OSError):
+                total += os.lstat(os.path.join(root, name)).st_blocks * 512
+    return total
+
+
+def _label(app: _App) -> str:
+    '''App name, with its folder when it lives in one (Python 3.13/IDLE).'''
+    parent = app.path.parent
+    if parent in (Path('/Applications'), HOME / 'Applications'):
+        return app.path.stem
+    return f'{parent.name.removesuffix(".localized")}/{app.path.stem}'
+
+
+def _other_names(app: _App, apps: Sequence[_App]) -> set[str]:
+    return {n for a in apps if a is not app for n in a.names}
+
+
+def _sizes(paths: Sequence[Path]) -> list[int]:
+    return list(_IO_POOL.map(_tree_size, paths))
+
+
+def _last_used(paths: Sequence[Path]) -> list[float | None]:
+    '''Spotlight's last-opened date per path; None when never recorded.'''
+    if not paths:
+        return []
+    try:
+        out = subprocess.run(
+            ['mdls', '-raw', '-name', 'kMDItemLastUsedDate', *map(str, paths)],
+            capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return [None] * len(paths)
+    from datetime import datetime
+    values: list[float | None] = []
+    for raw in out.split('\0')[:len(paths)]:
+        try:
+            values.append(datetime.strptime(raw.strip(), '%Y-%m-%d %H:%M:%S %z').timestamp())
+        except ValueError:
+            values.append(None)
+    return values + [None] * (len(paths) - len(values))
+
+
+def _age(ts: float | None) -> str:
+    if ts is None:
+        return 'never recorded'
+    days = int((time.time() - ts) // 86400)
+    return 'today' if days == 0 else f'{days}d ago'
+
+
+def _needs_root(path: Path) -> bool:
+    '''Moving a directory rewrites its "..", so it must be writable itself.'''
+    try:
+        writable_self = not path.is_dir() or path.is_symlink() or os.access(path, os.W_OK)
+        return not (writable_self and os.access(path.parent, os.W_OK))
+    except OSError:
+        return True
+
+
+def _trash(paths: Sequence[Path]) -> list[Path]:
+    '''Move paths to the Trash, returning the ones that failed.
+
+    Finder first, because only Finder records where an item came from and so
+    offers Put Back; a plain rename into ~/.Trash is the fallback when
+    Automation access to Finder is denied.
+    '''
+    failed = []
+    for path in paths:
+        script = f'tell application "Finder" to delete (POSIX file {json.dumps(str(path))} as alias)'
+        ok = subprocess.run(['osascript', '-e', script], capture_output=True).returncode == 0
+        if not ok:
+            target = HOME / '.Trash' / path.name
+            if target.exists():
+                target = target.with_name(f'{path.name} {time.strftime("%H.%M.%S")}')
+            try:
+                os.rename(path, target)
+            except OSError:
+                failed.append(path)
+    return failed
+
+
+def _sudo_command(paths: Sequence[Path]) -> str:
+    '''The one command to run for root-owned leftovers: unload, then trash.'''
+    steps = [f'launchctl bootout system {shlex.quote(str(p))} 2>/dev/null'
+             for p in paths if p.parent == Path('/Library/LaunchDaemons')]
+    steps.append('mv ' + ' '.join(shlex.quote(str(p)) for p in paths)
+                 + f' {shlex.quote(str(HOME / ".Trash"))}/')
+    return f'sudo sh -c {shlex.quote("; ".join(steps))}'
+
+
+def _confirm(question: str, assume_yes: bool) -> bool:
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        print('not a terminal — pass --yes to proceed without asking')
+        return False
+    return input(f'{question} [y/N] ').strip().lower() in ('y', 'yes')
+
+
+def _remove_items(paths: list[Path], assume_yes: bool) -> int:
+    '''Show paths with sizes, ask, then trash what we can and print the rest.'''
+    sizes = _sizes(paths)
+    for path, size in sorted(zip(paths, sizes), key=lambda ps: -ps[1]):
+        mark = '  (needs sudo)' if _needs_root(path) else ''
+        print(f'  {_size_str(size):>9}  {str(path).replace(HOME_STR, "~")}{mark}')
+    print(f'  {_size_str(sum(sizes)):>9}  total, {len(paths)} items')
+    if DRY_RUN:
+        print('\ndry run — nothing moved')
+        return 0
+    if not _confirm(f'\nMove these {len(paths)} items to the Trash?', assume_yes):
+        print('nothing moved')
+        return 1
+    rooted = [p for p in paths if _needs_root(p)]
+    failed = _trash([p for p in paths if p not in rooted])
+    moved = len(paths) - len(rooted) - len(failed)
+    print(f'\nmoved {moved} items to the Trash — Finder\'s Put Back undoes it')
+    for path in failed:
+        print(f'  could not move {path}')
+    if rooted:
+        print('\nRoot-owned items left. To finish, run:')
+        print(f'  {_sudo_command(rooted)}')
+    return 1 if failed else 0
+
+
+def _apps_report() -> int:
+    '''Removable apps, biggest first, with last use and their Library data.'''
+    apps = _user_apps()
+    if not apps:
+        print('no apps found in /Applications or ~/Applications')
+        return 0
+    ids = _installed_ids()
+    entries = _library_entries()
+    for app, size, used in zip(apps, _sizes([a.path for a in apps]),
+                               _last_used([a.path for a in apps])):
+        app.size, app.last_used = size, used
+        app.data = sum(_sizes(_leftovers(app, ids, entries, _other_names(app, apps))))
+    cutoff = time.time() - UNUSED_DAYS * 86400
+    apps.sort(key=lambda a: -(a.size + a.data))
+    width = max(len(_label(a)) for a in apps)
+    print(f'  {"app":<{width}}  {"size":>9}  {"data":>9}  last used')
+    unused = []
+    for a in apps:
+        stale = a.last_used is None or a.last_used < cutoff
+        if stale:
+            unused.append(a)
+        print(f'{"*" if stale else " "} {_label(a):<{width}}  {_size_str(a.size):>9}  '
+              f'{_size_str(a.data):>9}  {_age(a.last_used)}')
+    if unused:
+        total = sum(a.size + a.data for a in unused)
+        print(f'\n* {len(unused)} apps unused for {UNUSED_DAYS}+ days, or never opened '
+              f'as far as Spotlight knows: {_size_str(total)} with their data')
+    print('\nRemove with: tidymac --uninstall "App Name" [...]')
+    return 0
+
+
+def _xcode_guard(app: _App) -> str:
+    '''Refuse to pull Xcode out from under xcode-select — git and cc go with it.'''
+    try:
+        dev = subprocess.run(['xcode-select', '-p'], capture_output=True,
+                             text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ''
+    if dev.startswith(str(app.path) + '/'):
+        fix = ('sudo xcode-select -s /Library/Developer/CommandLineTools'
+               if Path('/Library/Developer/CommandLineTools').is_dir()
+               else 'xcode-select --install   # then: sudo xcode-select -s /Library/Developer/CommandLineTools')
+        return f'{app.path.name} is the active developer directory. First run:\n  {fix}'
+    return ''
+
+
+def _uninstall(queries: Sequence[str], assume_yes: bool) -> int:
+    apps = _user_apps()
+    chosen: list[_App] = []
+    for query in queries:
+        q = query.lower().removesuffix('.app')
+        matches = [a for a in apps if q in (a.path.stem.lower(), _label(a).lower(), a.bid)
+                   or q in a.names]
+        if not matches:
+            matches = [a for a in apps if q in _label(a).lower()]
+        if len(matches) != 1:
+            names = ', '.join(_label(a) for a in matches) or 'nothing'
+            print(f'"{query}" matches {names} — give the exact app name')
+            return 2
+        if warning := _xcode_guard(matches[0]):
+            print(warning)
+            return 2
+        chosen.append(matches[0])
+
+    ids = _installed_ids()
+    entries = _library_entries()
+    paths: list[Path] = []
+    for app in chosen:
+        paths.append(app.path)
+        paths.extend(p for p in _leftovers(app, ids, entries, _other_names(app, apps))
+                     if p not in paths)
+    print(f'Uninstall {", ".join(_label(a) for a in chosen)}:')
+    if not DRY_RUN:
+        # Quit first: a running app rewrites its prefs and caches on the way out.
+        for app in chosen:
+            subprocess.run(['osascript', '-e', f'quit app id {json.dumps(app.bid)}'],
+                           capture_output=True, timeout=30)
+    return _remove_items(paths, assume_yes)
+
+
+def _orphans(assume_yes: bool) -> int:
+    '''Library data for bundle ids no installed app owns.'''
+    ids = _installed_ids()
+    if len(ids) < 20:
+        print('could not list installed apps (is Spotlight indexing off?) — '
+              'refusing to guess what is orphaned')
+        return 2
+    entries = _library_entries()
+    installed_names = {n for a in _user_apps() for n in a.names}
+    products = {n.replace(' ', '') for n in installed_names if len(n) >= 4}
+    gone: set[str] = set()
+    active: set[str] = set()
+    quiet = time.time() - ORPHAN_QUIET_DAYS * 86400
+    for path, base, _ in entries:
+        key, team = _entry_key(path.name)
+        if (base in _ORPHAN_EVIDENCE and not team and _RE_BUNDLE_ID.match(key)
+                and not key.startswith(_APPLE_IDS)
+                and not _product_owned(key, ids, products)):
+            gone.add(key)
+    # terminal-browser keeps its bundle somewhere no scan reaches, yet writes
+    # its preferences daily: fresh activity anywhere overrules "not installed".
+    for path, base, _ in entries:
+        key, _ = _entry_key(path.name)
+        if base != _NESTED and _owner(key, gone):
+            with contextlib.suppress(OSError):
+                if path.lstat().st_mtime > quiet:
+                    active.add(_owner(key, gone))
+    gone -= active
+    # A dead app's extensions and helpers live under its id; fold them into
+    # the shortest id they extend, so OneDrive reads as one app, not six.
+    roots = {k for k in gone if not any(k != o and k.startswith(o) for o in gone)}
+    paths = []
+    for path, base, _ in entries:
+        key, _ = _entry_key(path.name)
+        if (base != _NESTED and not key.startswith(_APPLE_IDS)
+                and not _product_owned(key, ids, products) and _owner(key, roots)):
+            paths.append(path)
+    paths += [HOME / dot for dot, name in _DOT_DIRS.items()
+              if name not in installed_names and (HOME / dot).is_dir()]
+    if not paths:
+        print('no orphaned app data found')
+        return 0
+    print(f'Data left by {len(roots)} apps that are no longer installed:')
+    return _remove_items(paths, assume_yes)
 
 
 # ── launchd agent ────────────────────────────────────────────────────────────
@@ -1653,17 +2666,42 @@ def main() -> None:
                         help='do not write a JSON run report')
     parser.add_argument('--install-agent', action='store_true',
                         help='write a weekly launchd agent and exit')
+    parser.add_argument('--apps', action='store_true',
+                        help='report installed apps by size, last use and Library data')
+    parser.add_argument('--uninstall', nargs='+', metavar='APP',
+                        help='move apps and their Library data to the Trash')
+    parser.add_argument('--orphans', action='store_true',
+                        help='move Library data of apps no longer installed to the Trash')
+    parser.add_argument('--yes', action='store_true',
+                        help='do not ask before --uninstall / --orphans move anything')
+    parser.add_argument('--claude-history', type=int, metavar='DAYS',
+                        help='also delete Claude Code session transcripts older than DAYS')
     args = parser.parse_args()
 
-    global DRY_RUN, WRITE_REPORT
+    global DRY_RUN, WRITE_REPORT, CLAUDE_HISTORY_DAYS
     DRY_RUN = args.dry_run
     WRITE_REPORT = not args.no_report
 
     if args.install_agent:
         _install_agent()
         return
+    try:
+        if args.apps:
+            raise SystemExit(_apps_report())
+        if args.uninstall:
+            raise SystemExit(_uninstall(args.uninstall, args.yes))
+        if args.orphans:
+            raise SystemExit(_orphans(args.yes))
+    finally:
+        if args.apps or args.uninstall or args.orphans:
+            _IO_POOL.shutdown(wait=False, cancel_futures=True)
     if args.snapshots:
         ALL_TASKS.append(_snapshots_task())
+    if args.claude_history is not None:
+        if args.claude_history < 1:
+            parser.error('--claude-history needs at least 1 day')
+        CLAUDE_HISTORY_DAYS = args.claude_history
+        ALL_TASKS.append(_claude_history_task())
 
     try:
         if args.headless:

@@ -1,6 +1,6 @@
 [project]
 name = "tidymac"
-version = "0.2.0"
+version = "0.3.0"
 description = "macOS upgrade + cleanup TUI — runs every task in parallel with per-task progress bars"
 readme = "README.md"
 requires-python = ">=3.11"

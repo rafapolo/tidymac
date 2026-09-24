@@ -60,11 +60,15 @@ tidymac --headless       # one line per task, no TUI (for launchd/cron)
 tidymac --snapshots      # also thin Time Machine local snapshots (needs sudo)
 tidymac --no-report      # skip the JSON run report
 tidymac --install-agent  # write a weekly launchd agent, then exit
+tidymac --claude-history 90  # also delete Claude Code transcripts older than 90 days
+tidymac --apps           # installed apps by size, Library data and last use
+tidymac --uninstall Discord "Microsoft Teams"   # app + its Library data → Trash
+tidymac --orphans        # Library data of apps that are no longer installed → Trash
 tidymac --help
 ```
 
 Flags combine: `tidymac --headless --dry-run` is a safe way to see what a
-scheduled run would do.
+scheduled run would do, and `--dry-run --uninstall X` lists what would go.
 
 In the TUI, press `q` to quit.
 
@@ -74,34 +78,91 @@ In the TUI, press `q` to quit.
 
 **Upgrades** — Homebrew (update, upgrade, casks, autoremove, cleanup, doctor),
 Oh My Zsh, Mac App Store (`mas`), Python tools (`pipx` / `uv` / `pipupgrade`),
-npm globals, `rustup`, Ruby gems, and macOS software updates.
+npm globals, `rustup`, Ruby gems, and macOS software updates. Also
+self-updates Claude Code, Bun and Deno (only copies Homebrew doesn't own),
+mise tools, asdf plugins, gcloud components and VS Code-family extensions.
+`flutter upgrade` is left out on purpose: it can break pinned projects.
 
 **System** — user caches, sandboxed app + group container caches, crash and
 diagnostic reports, saved app state, Trash (including per-volume trashes),
 QuickLook thumbnails, logs older than 30 days, non-English `.lproj` language
 packs, `.DS_Store` files, build cruft (`__pycache__`, `.pytest_cache`,
 `.ruff_cache`, `.mypy_cache`, `.ipynb_checkpoints`), temp dirs, DNS and font
-caches, Docker prune.
+caches, Docker and Podman prune, downloaded aerial wallpaper videos nothing
+uses, and `~/.cache` directories untouched for 30 days (judged by the newest
+file inside, not the folder date).
 
 **Browsers** — Safari, Chrome, Chrome Canary, Chromium, Brave, Edge, Vivaldi,
 Opera, Arc, Dia, Firefox, Zen, LibreWolf, Tor, Orion. Chromium-family browsers
-are cleaned across *every* profile.
+are cleaned across *every* profile. Google Updater's download cache too.
 
 **Dev** — JS/Node (npm, yarn, pnpm store prune, bun, Vite, Webpack, Turbo,
 Cypress, Puppeteer, esbuild, Nx, nvm), JVM (Gradle, Maven), Python (pip,
 Poetry, pyenv, conda, uv, pre-commit, Jupyter), Go, Rust (Cargo registry,
 rustup downloads, sccache), Ruby/PHP (gem cache, Bundler, Composer), plus
 NuGet, Swift PM, Deno, kubectl, AWS CLI, gh, Helm, Terraform, ccache, gcloud,
-Ansible, Zig, yt-dlp, Ollama logs, PyTorch, Hugging Face.
+Ansible, Zig, yt-dlp, Ollama logs, PyTorch, Hugging Face, and Claude Code's
+per-session scratch (debug logs, shell snapshots, `/rewind` history) once
+30 days stale.
 
 **IDEs & Editors** — Xcode (DerivedData, Archives, DocCache, device logs and
 device support), iOS Simulator, Android Studio + SDK, JetBrains, VS Code,
-Cursor, Windsurf, Zed, Sublime Text, Neovim, CocoaPods, Flutter.
+Cursor, Windsurf, Zed, Sublime Text, Neovim, CocoaPods, Flutter, simulator
+runtimes unused for 90 days, and the old extension versions VS Code-family
+editors have marked obsolete but never deleted.
 
 **Apps** — Slack, Discord, Signal, Notion, Obsidian, Postman, Insomnia, Claude,
 GitHub Desktop, LM Studio, Telegram, Spotify, Zoom, Teams, Steam, Dropbox,
 Adobe media cache, Docker Desktop, VLC, Transmission, WhatsApp, UTM,
 LibreOffice.
+
+**Report only** — listed, never deleted: `node_modules` in projects untouched
+for 90 days, iPhone/iPad backups, files over 500 MB in `~/Downloads` unopened
+for 30 days, and `Install macOS` installer apps.
+
+---
+
+## Apps
+
+Dragging an app to the Trash leaves its data behind in `~/Library`, often
+more than the app itself: Teams' container outweighs half its bundle, and
+Cursor leaves gigabytes of extensions in `~/.cursor`.
+
+- **`--apps`** lists every app in `/Applications` and `~/Applications`,
+  biggest first, with its size, what it keeps in Library, and when Spotlight
+  last saw it opened. Anything unused for 90 days or never opened gets a `*`.
+- **`--uninstall APP…`** finds the app's data by bundle id (containers,
+  group containers, preferences, caches, logs, launch agents, WebKit and
+  HTTP storage, saved state, recent-documents lists, editor dot-dirs), shows
+  it with sizes, asks, then quits the app and moves it all to the Trash.
+- **`--orphans`** does the same for apps already gone.
+
+Both move things to the Trash through Finder, so **Put Back** is the undo.
+Root-owned pieces (the bundle itself, `/Library/LaunchDaemons`) aren't
+touched: tidymac prints the single `sudo` command that unloads and trashes
+them. `--yes` skips the question; `--dry-run` only lists.
+
+Deciding what counts as someone else's is the careful part:
+
+- A folder matching an app's **name** is only claimed when no other installed
+  app has that name too. The executable name isn't used at all: Claude
+  Code's URL handler runs a binary called `claude`, and would otherwise claim
+  the Claude app's data.
+- An id belongs to the **most specific** installed bundle id it extends, so
+  uninstalling Chrome leaves Chrome Canary's data alone.
+- `--orphans` only calls an app gone on evidence nothing else writes:
+  sandbox containers, extension scripts, saved window state, recent-documents
+  lists. It then spares any id whose vendor and product match something
+  installed, including helpers nested inside other apps
+  (`com.docker.helper` lives in `Docker.app`), renamed vendors
+  (MonitorControl, from `me.guillaumeb` to `app.monitorcontrol`), and any
+  id with files changed in the last 7 days, since something is still using it.
+- Uninstalling Xcode is refused while `xcode-select` points into it, since
+  `git` and the compilers would go with it. The fix is printed.
+
+After a big cleanup, the free-space number can stay flat. Deleted files that
+a Time Machine local snapshot still references keep their blocks until the
+snapshot ages out. When that's the case, tidymac says so at the end of a run.
 
 ---
 
@@ -114,6 +175,10 @@ this is what lets you compare one run against the last.
 ```sh
 jq .totals ~/.local/state/tidymac/last-run.json
 ```
+
+Each run ends by comparing itself with the previous run of the same kind
+(dry runs only against dry runs) and naming the tasks that grew the most:
+that's where the disk fills up between runs.
 
 Old reports are pruned automatically.
 
@@ -154,6 +219,13 @@ tidymac deletes regenerable data only, and a few deliberate choices back that:
 - Tasks touching the same tree or package manager hold a lock, so a
   `brew upgrade` can't race a `brew cleanup`, and the blanket cache sweep can't
   race a per-app cache task.
+- **Editor extensions**: only folders the editor itself listed in
+  `extensions/.obsolete` go, and never while that editor is running.
+- **Aerial videos**: any video the wallpaper store references, or that played
+  in the last 30 days, stays. If the store can't be read, nothing is deleted.
+- **Claude Code**: scratch tied to a session active in the last 30 days stays.
+  Transcripts (your `--resume` history) are only touched with
+  `--claude-history DAYS`.
 - Child processes get `/dev/null` on stdin and their own session, so nothing
   can steal keystrokes from the TUI or hang forever on a prompt.
 
