@@ -1,6 +1,6 @@
 [project]
 name = "tidymac"
-version = "0.1.0"
+version = "0.2.0"
 description = "macOS upgrade + cleanup TUI — runs every task in parallel with per-task progress bars"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -15,7 +15,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Topic :: System :: Systems Administration",
 ]
-dependencies = ["textual>=0.80"]
+dependencies = ["textual>=8.2"]
 
 [project.urls]
 Homepage = "https://github.com/rafapolo/tidymac"

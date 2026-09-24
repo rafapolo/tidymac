@@ -163,6 +163,31 @@ deleting them does reduce what you can roll back to locally.
 
 ---
 
+## Linux: `tidy`
+
+`tidylinux.py` is the Linux sibling: same engine and TUI, with a Linux task
+table — APT (`full-upgrade`, `autoremove`, `autoclean`), snaps (refresh plus
+dropping disabled revisions), Flatpak, the systemd journal, `~/.cache`,
+freedesktop Trash, and the native/snap/flatpak locations of browsers, editors
+and Electron apps.
+
+APT, snaps and the journal need root. Run from a terminal, `tidy` asks for the
+sudo password once before the TUI starts; `--no-sudo` skips those tasks
+instead. `--install-agent` writes a weekly systemd user timer.
+
+It ships as one self-contained file (a zipapp with Textual vendored in), so
+the target needs only `python3`:
+
+```sh
+uv pip install --target build/src --python-version 3.14 \
+    --python-platform x86_64-manylinux_2_28 --only-binary :all: 'textual>=8.2'
+cp tidylinux.py build/src/
+python3 -m zipapp build/src -m tidylinux:main -p '/usr/bin/env python3' -c -o build/tidy
+scp build/tidy host:.local/bin/tidy
+```
+
+---
+
 ## License
 
 MIT
