@@ -2,7 +2,10 @@
 
 A macOS upgrade + cleanup TUI. It upgrades your package managers and sweeps
 every cache it can find — dozens of tasks, all in **parallel**, with a live
-progress bar per task and a running total of what it freed.
+progress bar per task and a running total of what it freed. Big things that
+aren't its to delete (stale `node_modules`, device backups, old downloads) are
+listed instead, and `--apps` / `--uninstall` remove apps together with the
+data they leave behind in `~/Library`.
 
 ![tidymac running](docs/screenshot.png)
 
@@ -64,6 +67,7 @@ tidymac --claude-history 90  # also delete Claude Code transcripts older than 90
 tidymac --apps           # installed apps by size, Library data and last use
 tidymac --uninstall Discord "Microsoft Teams"   # app + its Library data → Trash
 tidymac --orphans        # Library data of apps that are no longer installed → Trash
+tidymac --yes            # with --uninstall / --orphans: don't ask first
 tidymac --help
 ```
 
