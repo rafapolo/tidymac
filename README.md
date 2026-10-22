@@ -92,7 +92,7 @@ diagnostic reports, saved app state, Trash (including per-volume trashes),
 QuickLook thumbnails, logs older than 30 days, non-English `.lproj` language
 packs, `.DS_Store` files, build cruft (`__pycache__`, `.pytest_cache`,
 `.ruff_cache`, `.mypy_cache`, `.ipynb_checkpoints`), temp dirs, DNS and font
-caches, Docker and Podman prune, downloaded aerial wallpaper videos nothing
+caches, Docker, Podman and Apple container prune, stale Docker update staging, downloaded aerial wallpaper videos nothing
 uses, and `~/.cache` directories untouched for 30 days (judged by the newest
 file inside, not the folder date).
 
@@ -107,7 +107,8 @@ rustup downloads, sccache), Ruby/PHP (gem cache, Bundler, Composer), plus
 NuGet, Swift PM, Deno, kubectl, AWS CLI, gh, Helm, Terraform, ccache, gcloud,
 Ansible, Zig, yt-dlp, Ollama logs, PyTorch, Hugging Face, and Claude Code's
 per-session scratch (debug logs, shell snapshots, `/rewind` history) once
-30 days stale.
+30 days stale, its `/tmp` scratchpads once a day stale, and opencode's
+per-project undo snapshots once 30 days stale.
 
 **IDEs & Editors** — Xcode (DerivedData, Archives, DocCache, device logs and
 device support), iOS Simulator, Android Studio + SDK, JetBrains, VS Code,
@@ -228,6 +229,8 @@ tidymac deletes regenerable data only, and a few deliberate choices back that:
 - **Aerial videos**: any video the wallpaper store references, or that played
   in the last 30 days, stays. If the store can't be read, nothing is deleted.
 - **Claude Code**: scratch tied to a session active in the last 30 days stays.
+  A `/tmp` scratchpad stays while it or its session's transcript moved in the
+  last day.
   Transcripts (your `--resume` history) are only touched with
   `--claude-history DAYS`.
 - Child processes get `/dev/null` on stdin and their own session, so nothing

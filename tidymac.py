@@ -635,6 +635,31 @@ async def _container_prune(tool: str, log: Callable[[str], None]) -> Result:
     return Result(freed=freed)
 
 
+async def _apple_container_prune(log: Callable[[str], None]) -> Result:
+    '''Stopped containers and dangling images of Apple's `container`.
+
+    Unlike Docker, its service is usually down, and that is when the stopped
+    containers pile up. Bring it up just for the prune, never installing a
+    kernel, and put it back down if it was down before.
+    '''
+    was_up = await _run_cmd(['container', 'system', 'status'], lambda _: None) == 0
+    if not was_up and await _run_cmd(
+            ['container', 'system', 'start', '--disable-kernel-install'], log) != 0:
+        log('container service would not start, skipping')
+        return SKIPPED
+    # Container disks are sparse: count allocated blocks, not what they advertise.
+    root = HOME / 'Library/Application Support/com.apple.container'
+    before = await _in_pool(lambda: _tree_size(root))
+    try:
+        await _run_series([['container', 'prune'],
+                           ['container', 'image', 'prune']], log)
+    finally:
+        if not was_up:
+            await _run_cmd(['container', 'system', 'stop'], log)
+    after = await _in_pool(lambda: _tree_size(root))
+    return Result(freed=max(0, before - after))
+
+
 async def _pip_clean(log: Callable[[str], None]) -> Result:
     files = 0
 
@@ -722,6 +747,18 @@ def _newest_use(root: str, stop: float) -> float:
         if os.path.isdir(cur) and not os.path.islink(cur):
             with contextlib.suppress(OSError), os.scandir(cur) as it:
                 stack.extend(e.path for e in it)
+    return newest
+
+
+def _newest_write(root: str, stop: float) -> float:
+    '''Latest mtime anywhere under root, bailing out once past stop.'''
+    newest = 0.0
+    for dirpath, dirs, files in os.walk(root):
+        for name in (dirpath, *(os.path.join(dirpath, f) for f in files)):
+            with contextlib.suppress(OSError):
+                newest = max(newest, os.lstat(name).st_mtime)
+        if newest > stop:
+            return newest
     return newest
 
 
@@ -957,6 +994,70 @@ async def _clean_claude_history(log: Callable[[str], None]) -> Result:
     freed, count = await _to_thread(_do)
     if freed or count:
         log(f'freed {_size_str(freed)} · {count:,} files')
+    return Result(freed=freed, files=count)
+
+
+_CLAUDE_TMP = Path(f'/private/tmp/claude-{os.getuid()}')
+
+
+async def _clean_claude_scratch(log: Callable[[str], None]) -> Result:
+    '''Claude Code's per-session scratchpads under /private/tmp/claude-<uid>.
+
+    Sessions park downloads, renders and intermediate data there, gigabytes at
+    a time, and nothing removes them until macOS reaps /tmp. A scratchpad goes
+    once it and its session's transcript have both sat still for a day.
+    '''
+    def _do() -> tuple[int, int]:
+        cutoff = time.time() - _DAY
+        recent = _claude_recent_sessions(cutoff)
+        freed = count = 0
+        for entry in _CLAUDE_TMP.glob('*/*'):
+            m = _RE_SESSION.match(entry.name)
+            if not m or m.group(0) in recent or not entry.is_dir():
+                continue
+            if _newest_use(str(entry), cutoff) > cutoff:
+                continue
+            f, c = _remove_entry(entry)
+            freed += f
+            count += c
+        return freed, count
+
+    freed, count = await _to_thread(_do)
+    if freed or count:
+        log(f'freed {_size_str(freed)} · {count:,} files')
+    return Result(freed=freed, files=count)
+
+
+_OPENCODE_SNAPSHOTS = HOME / '.local/share/opencode/snapshot'
+
+
+async def _clean_opencode_snapshots(log: Callable[[str], None]) -> Result:
+    '''opencode's per-project undo repos, once 30 days stale.
+
+    Each is a git store of the worktree opencode snapshots before every edit,
+    so a big project costs gigabytes. Only reverting a month-old session needs
+    them; `global` is shared, so it stays. Age counts writes only: anything
+    that walks git repos reads every `description`, so atime proves nothing.
+    '''
+    def _do() -> tuple[int, int, list[str]]:
+        cutoff = time.time() - 30 * _DAY
+        freed = count = 0
+        gone: list[str] = []
+        with contextlib.suppress(OSError), os.scandir(_OPENCODE_SNAPSHOTS) as it:
+            entries = [e for e in it if e.name != 'global'
+                       and e.is_dir(follow_symlinks=False)]
+        for e in entries:
+            if _newest_write(e.path, cutoff) > cutoff:
+                continue
+            f, c = _purge_tree(e.path)
+            freed += f
+            count += c
+            gone.append(f'{e.name[:12]}: {_size_str(f)}')
+        return freed, count, gone
+
+    freed, count, notes = await _in_pool(_do)
+    for line in notes:
+        log(line)
     return Result(freed=freed, files=count)
 
 
@@ -1394,6 +1495,9 @@ ALL_TASKS: list[Task] = [
     _path_task('containers',  'Sandboxed App Caches',  'System', ['~/Library/Containers/*/Data/Library/Caches/*']),
     _path_task('groupcache',  'Group Container Caches','System', ['~/Library/Group Containers/*/Library/Caches/*']),
     _path_task('appsupcache', 'App Support Caches',    'System', ['~/Library/Application Support/Caches/*']),
+    # Docker Desktop's updater stages a whole Docker.app here and can leave it
+    # behind. The bundle inside keeps its build date, so age the staging dir.
+    _path_task('dockerinst',  'Docker Update Staging', 'System', ['~/Library/Application Support/com.docker.install/in_progress'], min_age=86400),
     _path_task('ipsw',        'Device Software Updates','System', ['~/Library/iTunes/iPhone Software Updates/*', '~/Library/iTunes/iPad Software Updates/*']),
     *_collect(
         Task('aerials', 'Unused Aerial Videos', 'System', _clean_aerials,
@@ -1412,6 +1516,9 @@ ALL_TASKS: list[Task] = [
         Task('podman', 'Podman Prune', 'System',
              lambda log: _container_prune('podman', log),
              timeout=CMD_TIMEOUT) if _has('podman') else None,
+        Task('applecont', 'Apple container Prune', 'System',
+             _apple_container_prune, timeout=CMD_TIMEOUT,
+             locks=('app-support',)) if _has('container') else None,
     ),
     Task('dns', 'DNS Cache', 'System',
          lambda log: _simple_cmds([['dscacheutil', '-flushcache']], log)),
@@ -1541,6 +1648,10 @@ ALL_TASKS: list[Task] = [
         _dir_task('claudecli', 'Claude Code', 'Dev — Other', ['~/Library/Caches/claude-cli-nodejs/*'],   '~/Library/Caches/claude-cli-nodejs'),
         Task('claudestate', 'Claude Code state (30d+)', 'Dev — Other',
              _clean_claude_state) if _CLAUDE.is_dir() else None,
+        Task('claudetmp', 'Claude Code scratchpads (1d+)', 'Dev — Other',
+             _clean_claude_scratch) if _CLAUDE_TMP.is_dir() else None,
+        Task('opencodesnap', 'opencode snapshots (30d+)', 'Dev — Other',
+             _clean_opencode_snapshots) if _OPENCODE_SNAPSHOTS.is_dir() else None,
     ),
     # ── IDEs & Editors ───────────────────────────────────────────────────────
     *_collect(
