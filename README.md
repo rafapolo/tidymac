@@ -226,6 +226,9 @@ tidymac deletes regenerable data only, and a few deliberate choices back that:
   race a per-app cache task.
 - **Editor extensions**: only folders the editor itself listed in
   `extensions/.obsolete` go, and never while that editor is running.
+- **Code-sign clones** (the copy of Brave, Chrome & co. macOS makes in
+  `$TMPDIR/../X` at every launch): a clone with any file open stays, as does
+  one less than an hour old. If `lsof` can't answer, nothing is deleted.
 - **Aerial videos**: any video the wallpaper store references, or that played
   in the last 30 days, stays. If the store can't be read, nothing is deleted.
 - **Claude Code**: scratch tied to a session active in the last 30 days stays.

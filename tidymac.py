@@ -845,6 +845,54 @@ async def _clean_obsolete_extensions(log: Callable[[str], None]) -> Result:
     return Result(freed=freed, files=count)
 
 
+async def _clean_code_sign_clones(log: Callable[[str], None]) -> Result:
+    '''Copies of an app bundle macOS makes in $TMPDIR/../X at each launch.
+
+    Chromium browsers and a few Electron apps get a fresh
+    <bundle-id>.code_sign_clone/code_sign_clone.XXXXXX (~0.5–1.5 GB) per
+    launch, and one that is killed instead of quit never removes its own.
+    The running copy is the one with files open: lsof decides, and if lsof
+    can't answer nothing goes. An hour's grace covers an app mid-launch, still
+    copying before it opens anything.
+    '''
+    def _do() -> tuple[int, int, list[str]]:
+        tmp = os.confstr(65537)  # _CS_DARWIN_USER_TEMP_DIR, .../T/
+        if not tmp:
+            return 0, 0, []
+        root = Path(tmp).parent / 'X'
+        clones = [c for c in root.glob('*.code_sign_clone/code_sign_clone.*')
+                  if c.is_dir() and not c.is_symlink()]
+        if not clones:
+            return 0, 0, []
+        try:
+            out = subprocess.run(['lsof', '-Fn', '+D', str(root)], capture_output=True,
+                                 text=True, timeout=120, stdin=subprocess.DEVNULL).stdout
+        except (OSError, subprocess.SubprocessError):
+            return 0, 0, ['lsof failed, nothing removed']
+        held = {os.path.realpath(line[1:]) for line in out.splitlines() if line.startswith('n')}
+        stop = time.time() - 3600
+        freed = count = 0
+        notes: list[str] = []
+        for clone in clones:
+            real = os.path.realpath(clone)
+            if any(p == real or p.startswith(real + '/') for p in held):
+                notes.append(f'in use, kept {clone.parent.name}/{clone.name}')
+                continue
+            with contextlib.suppress(OSError):
+                if clone.stat().st_mtime > stop:
+                    continue
+            f, c = _purge_tree(str(clone))
+            freed += f
+            count += c
+            notes.append(f'{clone.parent.name}/{clone.name}  {_size_str(f)}')
+        return freed, count, notes
+
+    freed, count, notes = await _in_pool(_do)
+    for line in notes:
+        log(line)
+    return Result(freed=freed, files=count)
+
+
 _WALLPAPER = HOME / 'Library/Application Support/com.apple.wallpaper'
 
 
@@ -1498,6 +1546,7 @@ ALL_TASKS: list[Task] = [
     # Docker Desktop's updater stages a whole Docker.app here and can leave it
     # behind. The bundle inside keeps its build date, so age the staging dir.
     _path_task('dockerinst',  'Docker Update Staging', 'System', ['~/Library/Application Support/com.docker.install/in_progress'], min_age=86400),
+    Task('codesign', 'App Code-Sign Clones', 'System', _clean_code_sign_clones),
     _path_task('ipsw',        'Device Software Updates','System', ['~/Library/iTunes/iPhone Software Updates/*', '~/Library/iTunes/iPad Software Updates/*']),
     *_collect(
         Task('aerials', 'Unused Aerial Videos', 'System', _clean_aerials,
