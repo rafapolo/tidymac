@@ -3,6 +3,7 @@
 
   --dry-run        size everything up, delete nothing, run no commands
   --headless       one line per task instead of the TUI (for launchd/cron)
+  --clean-only     skip every upgrade, only clean
   --snapshots      also thin Time Machine local snapshots (needs sudo)
   --no-report      skip the JSON run report
   --install-agent  write a weekly launchd agent and exit
@@ -2820,6 +2821,8 @@ def main() -> None:
                         help='report what would be freed; delete nothing, run no commands')
     parser.add_argument('--headless', action='store_true',
                         help='no TUI, one line per task (for launchd/cron)')
+    parser.add_argument('--clean-only', action='store_true',
+                        help='skip every upgrade, only clean')
     parser.add_argument('--snapshots', action='store_true',
                         help='also delete Time Machine local snapshots (needs sudo)')
     parser.add_argument('--no-report', action='store_true',
@@ -2855,6 +2858,8 @@ def main() -> None:
     finally:
         if args.apps or args.uninstall or args.orphans:
             _IO_POOL.shutdown(wait=False, cancel_futures=True)
+    if args.clean_only:
+        ALL_TASKS[:] = [t for t in ALL_TASKS if t.subcategory != 'Upgrades']
     if args.snapshots:
         ALL_TASKS.append(_snapshots_task())
     if args.claude_history is not None:

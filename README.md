@@ -60,6 +60,7 @@ tidymac --dry-run
 tidymac                  # the TUI — upgrade everything, clean everything
 tidymac --dry-run        # size it all up, delete nothing, run no commands
 tidymac --headless       # one line per task, no TUI (for launchd/cron)
+tidymac --clean-only     # skip every upgrade, only clean
 tidymac --snapshots      # also thin Time Machine local snapshots (needs sudo)
 tidymac --no-report      # skip the JSON run report
 tidymac --install-agent  # write a weekly launchd agent, then exit
